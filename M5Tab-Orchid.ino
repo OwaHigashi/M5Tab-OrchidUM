@@ -1,39 +1,43 @@
 // M5Tab-Orchid
-// M5Stack Tab5 Chord Synthesizer inspired by Telepathic Instruments Orchid
-// Board : M5Stack Tab5 (ESP32-P4 + ESP32-C6 via ESP-Hosted)
+// M5Stack Tab5 Chord Controller inspired by Telepathic Instruments Orchid
+// Board : M5Stack Tab5 (ESP32-P4)
 // Libs  : M5Unified, M5GFX
 //
-// Features inspired by Orchid:
-//   - 16-voice polyphonic synthesizer
-//   - Chord generation: root note + chord type + voicing
-//   - Virtual analog, FM, and lead/piano synth engines
-//   - Bass synth engine for low frequencies
-//   - Effects: delay, reverb, chorus
-//   - 1280x720 touch UI optimized for Tab5
-//   - MIDI input support (M5 Unit MIDI via PortA)
-//   - Program Change for preset/engine/chord switching
+// Audio output: external M5 Unit MIDI (SAM2695) on PortA UART.
+// The Tab5 is a controller — it does NOT synthesize audio internally.
 //
-// UI Layout:
-//   - Top: Synth engine selector, preset display
-//   - Center: One-octave velocity-sensitive keyboard (root note selection)
-//   - Middle: Chord type selector (Major, Minor, 7th, Sus, Dim, Aug, etc.)
-//   - Bottom: Chord voicing controls, bass toggle, effects panel
+// Chord system follows the real Orchid manual:
+//   Top row    — chord BASE (radio): Major / Minor / Sus / Dim
+//   Bottom row — chord MODIFIERS (toggle, combinable): 6 / M7 / m7 / 9
+//   Sus uses explicit "m7"; Major/Minor/Dim use bare "7".
+//   Special override labels:
+//     Minor + M7+m7+9        → "CmJAZZ"
+//     Sus   + 6+m7+9         → "CsusJAZZ"
+//     Dim   + 6+m7+9         → "CdimJAZZ"
+//     Dim   + M7+m7+6+9      → "CdimWTF"
 //
-// MIDI Program Change mapping:
-//   PC 0-2   : Synth engines (Analog, FM, Piano)
-//   PC 10-19 : Chord types (Major, Minor, Maj7, Min7, Dom7, Sus2, Sus4, Dim, Aug, Add9)
-//   PC 100   : Bass toggle ON
-//   PC 101   : Bass toggle OFF
-//   PC 110-127: Presets (engine + effects combinations)
+// Performance Mode (Orchid manual): one of 7, cycled by the PERF button.
+//   Strum / Strum 2oct / Slop / Arp / Arp 2oct / Pattern / Harp
+//   The Perf slider gives the per-mode parameter (strum/arp rate, etc.) and
+//   stays where it is set — it does NOT spring back.
+//
+// MIDI routing:
+//   Chord notes → Ch 1 with current GM program
+//   Bass note   → Ch 2, GM 38 (Synth Bass 1)
+//   Reverb / Chorus → CC 91 / CC 93 on Ch 1 & Ch 2
+//   Bend slider     → 14-bit MIDI Pitch Bend; springs back to centre.
 
 #include <M5Unified.h>
-#include <driver/uart.h>
 #include <math.h>
 
 // ==== Tab5 PortA UART for M5 Unit MIDI ====
 #define RXD2 54
 #define TXD2 53
 #define MIDI_BAUD 31250
+
+// ==== MIDI Channels (zero-based) ====
+static constexpr uint8_t MIDI_CH_CHORD = 0;
+static constexpr uint8_t MIDI_CH_BASS  = 1;
 
 // ==== Screen ====
 static constexpr int SCREEN_W = 1280;
@@ -47,742 +51,999 @@ static constexpr int SCREEN_H = 720;
 
 // ==== Colors ====
 static constexpr uint16_t COL_BG         = TFT_BLACK;
-static constexpr uint16_t COL_PANEL      = 0x10A2;  // dark slate
-static constexpr uint16_t COL_BTN        = 0x2945;  // slate
+static constexpr uint16_t COL_PANEL      = 0x10A2;
+static constexpr uint16_t COL_BTN        = 0x2945;
 static constexpr uint16_t COL_BTN_ACTIVE = TFT_GREEN;
 static constexpr uint16_t COL_BTN_TXT    = TFT_WHITE;
 static constexpr uint16_t COL_WHITEKEY   = TFT_WHITE;
 static constexpr uint16_t COL_BLACKKEY   = 0x2104;
 static constexpr uint16_t COL_ACCENT     = TFT_CYAN;
 static constexpr uint16_t COL_VALUE      = TFT_YELLOW;
-static constexpr uint16_t COL_MUTED      = 0x7BEF;  // grey
+static constexpr uint16_t COL_MUTED      = 0x7BEF;
 
-// ==== Synth Configuration ====
-static constexpr int MAX_VOICES = 16;
-static constexpr int SAMPLE_RATE = 44100;
-static constexpr int BUFFER_SIZE = 512;
-
-// ==== Synth Engine Types ====
-enum SynthEngine {
-  ENGINE_VIRTUAL_ANALOG,
-  ENGINE_FM,
-  ENGINE_LEAD_PIANO
+// ==== GM Program names ====
+static const char* const kGmInstrumentNames[128] = {
+  "Grand Piano 1", "Bright Piano 2", "El Grd Piano 3", "Honky-Tonk Piano",
+  "Electric Piano 1", "Electric Piano 2", "Harpsichord", "Clavi",
+  "Celesta", "Glockenspiel", "Music Box", "Vibraphone",
+  "Marimba", "Xylophone", "Tubular Bells", "Santur",
+  "Drawbar Organ", "Percussive Organ", "Rock Organ", "Church Organ",
+  "Reed Organ", "Accordion French", "Harmonica", "Tango Accordion",
+  "Ac Guitar Nylon", "Ac Guitar Steel", "Ac Guitar Jazz", "Ac Guitar Clean",
+  "Ac Guitar Muted", "Overdriven Guitar", "Distortion Guitar", "Guitar Harmonics",
+  "Acoustic Bass", "Finger Bass", "Picked Bass", "Fretless Bass",
+  "Slap Bass 1", "Slap Bass 2", "Synth Bass 1", "Synth Bass 2",
+  "Violin", "Viola", "Cello", "Contrabass",
+  "Tremolo Strings", "Pizzicato Strings", "Orchestral Harp", "Timpani",
+  "String Ensemble 1", "String Ensemble 2", "Synth Strings 1", "Synth Strings 2",
+  "Choir Aahs", "Voice Oohs", "Synth Voice", "Orchestra Hit",
+  "Trumpet", "Trombone", "Tuba", "Muted Trumpet",
+  "French Horn", "Brass Section", "Synth Brass 1", "Synth Brass 2",
+  "Soprano Sax", "Alto Sax", "Tenor Sax", "Baritone Sax",
+  "Oboe", "English Horn", "Bassoon", "Clarinet",
+  "Piccolo", "Flute", "Recorder", "Pan Flute",
+  "Blown Bottle", "Shakuhachi", "Whistle", "Ocarina",
+  "Lead 1 Square", "Lead 2 Sawtooth", "Lead 3 Calliope", "Lead 4 Chiff",
+  "Lead 5 Charang", "Lead 6 Voice", "Lead 7 Fifths", "Lead 8 Bass+Lead",
+  "Pad 1 Fantasia", "Pad 2 Warm", "Pad 3 PolySynth", "Pad 4 Choir",
+  "Pad 5 Bowed", "Pad 6 Metallic", "Pad 7 Halo", "Pad 8 Sweep",
+  "FX 1 Rain", "FX 2 Soundtrack", "FX 3 Crystal", "FX 4 Atmosphere",
+  "FX 5 Brightness", "FX 6 Goblins", "FX 7 Echoes", "FX 8 Sci-Fi",
+  "Sitar", "Banjo", "Shamisen", "Koto",
+  "Kalimba", "Bag Pipe", "Fiddle", "Shanai",
+  "Tinkle Bell", "Agogo", "Steel Drums", "Woodblock",
+  "Taiko Drum", "Melodic Tom", "Synth Drum", "Reverse Cymbal",
+  "Guitar Fret Noise", "Breath Noise", "Seashore", "Bird Tweet",
+  "Telephone Ring", "Helicopter", "Applause", "Gunshot"
 };
 
-// ==== Chord Types ====
-enum ChordType {
-  CHORD_MAJOR,
-  CHORD_MINOR,
-  CHORD_MAJOR7,
-  CHORD_MINOR7,
-  CHORD_DOM7,
-  CHORD_SUS2,
-  CHORD_SUS4,
-  CHORD_DIM,
-  CHORD_AUG,
-  CHORD_ADD9,
-  CHORD_COUNT
+static const uint8_t BASS_PROGRAM = 38;
+
+// ==== Chord base (Top Keys) ====
+enum ChordBase {
+  BASE_MAJOR, BASE_MINOR, BASE_SUS, BASE_DIM, BASE_COUNT
+};
+static const int8_t baseIntervals[BASE_COUNT][3] = {
+  {0, 4, 7}, {0, 3, 7}, {0, 5, 7}, {0, 3, 6}
+};
+static const char* const baseLabels[BASE_COUNT] = {"Major", "Minor", "Sus", "Dim"};
+static const char* const baseSuffix[BASE_COUNT] = {"", "m", "sus", "dim"};
+
+// ==== Chord modifiers (Bottom Keys) ====
+static constexpr uint8_t MOD_6  = 0x01;
+static constexpr uint8_t MOD_M7 = 0x02;
+static constexpr uint8_t MOD_m7 = 0x04;
+static constexpr uint8_t MOD_9  = 0x08;
+static const uint8_t modFlags[4]      = {MOD_6, MOD_M7, MOD_m7, MOD_9};
+static const int8_t  modIntervals[4]  = {9, 11, 10, 14};
+static const char* const modLabels[4] = {"6", "M7", "m7", "9"};
+
+// ==== Performance Mode ====
+enum PerfMode {
+  PERF_STRUM,
+  PERF_STRUM_2OCT,
+  PERF_SLOP,
+  PERF_ARP,
+  PERF_ARP_2OCT,
+  PERF_PATTERN,
+  PERF_HARP,
+  PERF_COUNT
+};
+static const char* const perfModeNames[PERF_COUNT] = {
+  "Strum", "Strum 2oct", "Slop", "Arp", "Arp 2oct", "Pattern", "Harp"
 };
 
-// Chord interval definitions (semitones from root)
-static const int8_t chordIntervals[][6] = {
-  {0, 4, 7, -1, -1, -1},        // Major (root, M3, P5)
-  {0, 3, 7, -1, -1, -1},        // Minor (root, m3, P5)
-  {0, 4, 7, 11, -1, -1},        // Major7 (root, M3, P5, M7)
-  {0, 3, 7, 10, -1, -1},        // Minor7 (root, m3, P5, m7)
-  {0, 4, 7, 10, -1, -1},        // Dom7 (root, M3, P5, m7)
-  {0, 2, 7, -1, -1, -1},        // Sus2 (root, M2, P5)
-  {0, 5, 7, -1, -1, -1},        // Sus4 (root, P4, P5)
-  {0, 3, 6, -1, -1, -1},        // Dim (root, m3, d5)
-  {0, 4, 8, -1, -1, -1},        // Aug (root, M3, A5)
-  {0, 4, 7, 14, -1, -1},        // Add9 (root, M3, P5, M9)
-};
+// ==== State ====
+static uint8_t   currentProgram = 0;
+static ChordBase currentBase    = BASE_MAJOR;
+static uint8_t   currentMods    = 0;
+static int8_t    rootNote       = 60;
+static bool      bassEnabled    = false;
+static PerfMode  currentPerfMode = PERF_STRUM;
+static uint16_t  bpm            = 120;
 
-static const char* chordNames[] = {
-  "Major", "Minor", "Maj7", "Min7", "Dom7",
-  "Sus2", "Sus4", "Dim", "Aug", "Add9"
-};
+// Maximum number of notes we may have on the wire at once (4-octave Harp
+// expansion can produce up to 16 notes from a 4-note chord).
+static constexpr int MAX_NOTES = 20;
 
-// ==== Voice Structure ====
-struct Voice {
-  bool active;
-  uint8_t note;
-  uint8_t velocity;
-  float phase;
-  float frequency;
-  float amplitude;
-  uint32_t startTime;
+// Active MIDI notes (non-arp; strum appends to this as it emits)
+static uint8_t activeChordNotes[MAX_NOTES];
+static uint8_t activeChordCount = 0;
 
-  // ADSR envelope
-  enum EnvStage { ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE, ENV_OFF };
-  EnvStage envStage;
-  float envLevel;
-};
+// Bass voice
+static uint8_t activeBassNote = 0;
+static bool    bassNoteActive = false;
 
-// ==== Synth State ====
-static Voice voices[MAX_VOICES];
-static SynthEngine currentEngine = ENGINE_VIRTUAL_ANALOG;
-static ChordType currentChordType = CHORD_MAJOR;
-static int8_t rootNote = 60; // Middle C
-static bool bassEnabled = false;
-static uint8_t bassNote = 0;
+// Strum queue — drives Strum, Strum 2oct, Slop, and Harp one-shots.
+static uint8_t  strumNotes[MAX_NOTES];
+static uint8_t  strumCount     = 0;
+static uint8_t  strumIndex     = 0;
+static uint32_t strumLastEmitMs= 0;
+static bool     strumActive    = false;
+static PerfMode strumMode      = PERF_STRUM;  // mode that started the current strum
 
-// Effect parameters
-static float delayMix = 0.0f;
-static float reverbMix = 0.0f;
+// Arpeggiator loop — drives Arp, Arp 2oct, and Pattern.
+static uint8_t  arpNotes[MAX_NOTES];
+static uint8_t  arpNoteCount   = 0;
+static uint8_t  arpIndex       = 0;
+static uint8_t  arpCurrentNote = 0;
+static bool     arpNoteActive  = false;
+static uint32_t arpLastTickMs  = 0;
+static PerfMode arpMode        = PERF_ARP;
+
+// Pattern mode — a fixed step sequence over chord-note indices (Orchid's
+// "Pattern" mode plays the chord notes in a non-monotonic rhythm rather than
+// the straight up sweep of the arpeggiator).
+static const uint8_t patternSeq[] = {0, 2, 1, 2, 0, 3, 2, 1};
+static constexpr int PATTERN_LEN = sizeof(patternSeq);
+static int patternStep = 0;
+
+// Effect / performance sliders
+static float perfParam = 0.5f;  // mode-dependent speed/depth; doesn't spring back
+static float bendValue = 0.5f;  // 14-bit pitch bend; springs back to centre
+static float reverbMix = 0.2f;
 static float chorusMix = 0.0f;
 
-// MIDI state
-static unsigned long midiInCount = 0;
+// Preset
 static uint8_t currentPreset = 0;
-
-// ==== Preset Structure ====
 struct Preset {
-  SynthEngine engine;
-  float delay;
-  float reverb;
-  float chorus;
-  bool bass;
+  uint8_t program;
+  float   reverb;
+  float   chorus;
+  bool    bass;
   const char* name;
 };
-
-// Preset bank (PC 110-127)
 static const Preset presets[] = {
-  {ENGINE_VIRTUAL_ANALOG, 0.0f, 0.2f, 0.0f, false, "Clean Analog"},
-  {ENGINE_VIRTUAL_ANALOG, 0.3f, 0.4f, 0.1f, true,  "Bass Analog"},
-  {ENGINE_FM, 0.4f, 0.3f, 0.2f, false, "FM Space"},
-  {ENGINE_FM, 0.1f, 0.5f, 0.0f, false, "FM Reverb"},
-  {ENGINE_LEAD_PIANO, 0.2f, 0.3f, 0.0f, false, "Piano"},
-  {ENGINE_LEAD_PIANO, 0.3f, 0.6f, 0.2f, true,  "Piano Hall"},
-  {ENGINE_VIRTUAL_ANALOG, 0.5f, 0.5f, 0.3f, true,  "Ambient"},
-  {ENGINE_FM, 0.6f, 0.7f, 0.4f, false, "Deep Space"},
+  {  0, 0.2f, 0.0f, false, "Grand Piano" },
+  {  0, 0.6f, 0.2f, true,  "Piano Hall"  },
+  { 81, 0.3f, 0.1f, false, "Saw Lead"    },
+  { 88, 0.5f, 0.3f, true,  "Fantasia Pad"},
+  { 48, 0.4f, 0.2f, false, "Strings"     },
 };
 static constexpr int PRESET_COUNT = sizeof(presets) / sizeof(Preset);
 
-// ==== UI Geometry ====
+// ==== Geometry ====
 struct Rect { int x, y, w, h; };
 struct PianoKey { Rect r; uint8_t note; bool isBlack; };
 
-static PianoKey pianoKeys[13]; // One octave (C to C)
-static Rect chordTypeButtons[CHORD_COUNT];
-static Rect engineButtons[3];
-static Rect effectSliders[3];
+static constexpr int CHORD_PAD_X   = 14;
+static constexpr int CHORD_PAD_W   = 610;
+static constexpr int BASE_BTN_Y    = 20;
+static constexpr int BASE_BTN_H    = 150;
+static constexpr int MOD_BTN_Y     = 190;
+static constexpr int MOD_BTN_H     = 150;
+static constexpr int LEFT_EFX_Y    = 360;
+static constexpr int EFX_SLIDER_H  = 70;
+static constexpr int EFX_GAP       = 8;
+static constexpr int EFX_COUNT     = 4;
 
-// ==== Audio Generation ====
+static constexpr int RIGHT_X       = 640;
+static constexpr int RIGHT_W       = 640;
 
-float noteToFreq(uint8_t note) {
-  return 440.0f * powf(2.0f, (note - 69) / 12.0f);
+// Chord-name area is split between the chord label and the perf-mode label.
+static constexpr int CHORD_NAME_Y  = 230;
+static constexpr int CHORD_NAME_H  = 96;
+static constexpr int CHORD_NAME_X  = 650;
+static constexpr int CHORD_NAME_W  = 380;
+static constexpr int PERF_LBL_X    = 1040;
+static constexpr int PERF_LBL_W    = 240;
+
+static constexpr int PIANO_Y       = 334;
+static constexpr int PIANO_WHITE_W = 79;
+static constexpr int PIANO_WHITE_H = 380;
+static constexpr int PIANO_BLACK_W = 50;
+static constexpr int PIANO_BLACK_H = 240;
+
+static PianoKey pianoKeys[13];
+static Rect chordBaseButtons[BASE_COUNT];
+static Rect chordModButtons[4];
+static Rect effectSliders[EFX_COUNT];
+
+// Right-column header
+static Rect bpmDownBtn        = { 650,  14,  70, 64};
+static Rect bpmDisplayRect    = { 730,  14, 200, 64};
+static Rect bpmUpBtn          = { 940,  14,  70, 64};
+static Rect presetDisplayRect = {1020,  14, 260, 64};
+static Rect prgDownBtn        = { 650,  86,  80, 64};
+static Rect prgDisplayRect    = { 740,  86, 460, 64};
+static Rect prgUpBtn          = {1210,  86,  70, 64};
+static Rect bassToggleRect    = { 650, 158, 210, 64};
+static Rect perfToggleRect    = { 870, 158, 410, 64};  // wide so the mode name fits
+
+// ==== Forward declarations ====
+void drawUI();
+void drawHeader();
+void drawHeaderToggles();
+void drawChordPad();
+void drawChordNameDisplay();
+void drawEffectsPanel();
+void drawPianoKeyboard();
+static void drawSlider(int idx, const char* label, float value, bool bipolar);
+
+// ==== MIDI OUT helpers ====
+static inline void midiWrite(uint8_t b) { Serial2.write(b); }
+
+void sendNoteOn(uint8_t ch, uint8_t note, uint8_t vel) {
+  midiWrite(0x90 | (ch & 0x0F));
+  midiWrite(note & 0x7F);
+  midiWrite(vel & 0x7F);
 }
-
-void initVoice(Voice& v, uint8_t note, uint8_t velocity) {
-  v.active = true;
-  v.note = note;
-  v.velocity = velocity;
-  v.phase = 0.0f;
-  v.frequency = noteToFreq(note);
-  v.amplitude = velocity / 127.0f;
-  v.startTime = millis();
-  v.envStage = Voice::ENV_ATTACK;
-  v.envLevel = 0.0f;
+void sendNoteOff(uint8_t ch, uint8_t note) {
+  midiWrite(0x80 | (ch & 0x0F));
+  midiWrite(note & 0x7F);
+  midiWrite(0);
 }
+void sendProgramChange(uint8_t ch, uint8_t program) {
+  midiWrite(0xC0 | (ch & 0x0F));
+  midiWrite(program & 0x7F);
+}
+void sendControlChange(uint8_t ch, uint8_t cc, uint8_t val) {
+  midiWrite(0xB0 | (ch & 0x0F));
+  midiWrite(cc & 0x7F);
+  midiWrite(val & 0x7F);
+}
+void sendPitchBend(uint8_t ch, uint16_t bend14) {
+  if (bend14 > 16383) bend14 = 16383;
+  midiWrite(0xE0 | (ch & 0x0F));
+  midiWrite((uint8_t)(bend14 & 0x7F));
+  midiWrite((uint8_t)((bend14 >> 7) & 0x7F));
+}
+void sendAllNotesOff(uint8_t ch) { sendControlChange(ch, 123, 0); }
 
-Voice* findFreeVoice() {
-  for (int i = 0; i < MAX_VOICES; i++) {
-    if (!voices[i].active) return &voices[i];
+void applyChordProgram() {
+  sendProgramChange(MIDI_CH_CHORD, currentProgram);
+  sendProgramChange(MIDI_CH_BASS,  BASS_PROGRAM);
+}
+void applyMixEffects() {
+  uint8_t r = (uint8_t)(reverbMix * 127.0f);
+  uint8_t c = (uint8_t)(chorusMix * 127.0f);
+  for (uint8_t ch : {MIDI_CH_CHORD, MIDI_CH_BASS}) {
+    sendControlChange(ch, 91, r);
+    sendControlChange(ch, 93, c);
   }
-  // Voice stealing: find oldest voice
-  Voice* oldest = &voices[0];
-  for (int i = 1; i < MAX_VOICES; i++) {
-    if (voices[i].startTime < oldest->startTime) {
-      oldest = &voices[i];
+}
+void applyPitchBend() {
+  uint16_t b = (uint16_t)(bendValue * 16383.0f);
+  sendPitchBend(MIDI_CH_CHORD, b);
+  sendPitchBend(MIDI_CH_BASS,  b);
+}
+
+// ==== Chord building ====
+
+static void sortAscending(uint8_t* a, int n) {
+  for (int i = 1; i < n; i++) {
+    uint8_t v = a[i];
+    int j = i - 1;
+    while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; }
+    a[j + 1] = v;
+  }
+}
+
+// Base chord (Top + Bottom keys), sorted ascending. Up to ~7 notes.
+int buildBaseChordNotes(uint8_t root, uint8_t* out) {
+  int n = 0;
+  for (int i = 0; i < 3 && n < MAX_NOTES; i++) {
+    int v = (int)root + baseIntervals[currentBase][i];
+    if (v >= 0 && v < 128) out[n++] = (uint8_t)v;
+  }
+  for (int i = 0; i < 4 && n < MAX_NOTES; i++) {
+    if (currentMods & modFlags[i]) {
+      int v = (int)root + modIntervals[i];
+      if (v >= 0 && v < 128) out[n++] = (uint8_t)v;
     }
   }
-  return oldest;
+  sortAscending(out, n);
+  return n;
 }
 
-void noteOn(uint8_t note, uint8_t velocity) {
-  Voice* v = findFreeVoice();
-  initVoice(*v, note, velocity);
+// Duplicate the chord +12 semitones. Used by Strum 2 oct and Arp 2 oct.
+int expandTwoOctaves(uint8_t* notes, int n) {
+  int orig = n;
+  for (int i = 0; i < orig && n < MAX_NOTES; i++) {
+    int v = (int)notes[i] + 12;
+    if (v < 128) notes[n++] = (uint8_t)v;
+  }
+  sortAscending(notes, n);
+  return n;
 }
 
-void noteOff(uint8_t note) {
-  for (int i = 0; i < MAX_VOICES; i++) {
-    if (voices[i].active && voices[i].note == note) {
-      voices[i].envStage = Voice::ENV_RELEASE;
+// Spread the chord across four octaves for the Harp glissando: -1, 0, +1, +2
+// relative to the base chord. Telepathic describe Harp as "a harp being
+// strummed to the sound of a given chord across a four-octave range".
+int expandHarp(uint8_t* notes, int n) {
+  if (n == 0) return 0;
+  uint8_t base[MAX_NOTES];
+  int baseN = n;
+  for (int i = 0; i < baseN; i++) base[i] = notes[i];
+
+  int outN = 0;
+  for (int oct = -1; oct <= 2 && outN < MAX_NOTES; oct++) {
+    for (int i = 0; i < baseN && outN < MAX_NOTES; i++) {
+      int v = (int)base[i] + oct * 12;
+      if (v >= 0 && v < 128) notes[outN++] = (uint8_t)v;
     }
   }
+  sortAscending(notes, outN);
+  return outN;
 }
 
-void allNotesOff() {
-  for (int i = 0; i < MAX_VOICES; i++) {
-    voices[i].active = false;
+void buildChordName(char* out, size_t cap) {
+  static const char* const noteNames[12] =
+    {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+  const char* rn = noteNames[((rootNote % 12) + 12) % 12];
+
+  if (currentBase == BASE_MINOR && currentMods == (MOD_M7 | MOD_m7 | MOD_9)) {
+    snprintf(out, cap, "%smJAZZ", rn); return;
   }
-}
-
-// Simple virtual analog oscillator (sawtooth)
-float generateVirtualAnalog(Voice& v) {
-  float sample = 2.0f * (v.phase - 0.5f); // Sawtooth
-  v.phase += v.frequency / SAMPLE_RATE;
-  if (v.phase >= 1.0f) v.phase -= 1.0f;
-  return sample;
-}
-
-// Simple FM synthesis (2-operator)
-float generateFM(Voice& v) {
-  static float modPhase = 0.0f;
-  float modFreq = v.frequency * 2.0f;
-  float modIndex = 2.0f;
-
-  float modulator = sinf(2.0f * PI * modPhase);
-  float sample = sinf(2.0f * PI * (v.phase + modIndex * modulator));
-
-  v.phase += v.frequency / SAMPLE_RATE;
-  modPhase += modFreq / SAMPLE_RATE;
-
-  if (v.phase >= 1.0f) v.phase -= 1.0f;
-  if (modPhase >= 1.0f) modPhase -= 1.0f;
-
-  return sample;
-}
-
-// Simple lead/piano (sine with harmonics)
-float generateLeadPiano(Voice& v) {
-  float fundamental = sinf(2.0f * PI * v.phase);
-  float harmonic2 = 0.3f * sinf(4.0f * PI * v.phase);
-  float harmonic3 = 0.15f * sinf(6.0f * PI * v.phase);
-
-  v.phase += v.frequency / SAMPLE_RATE;
-  if (v.phase >= 1.0f) v.phase -= 1.0f;
-
-  return fundamental + harmonic2 + harmonic3;
-}
-
-// Simple ADSR envelope
-void updateEnvelope(Voice& v, float dt) {
-  const float attackTime = 0.01f;  // 10ms
-  const float decayTime = 0.1f;    // 100ms
-  const float sustainLevel = 0.7f;
-  const float releaseTime = 0.2f;  // 200ms
-
-  switch (v.envStage) {
-    case Voice::ENV_ATTACK:
-      v.envLevel += dt / attackTime;
-      if (v.envLevel >= 1.0f) {
-        v.envLevel = 1.0f;
-        v.envStage = Voice::ENV_DECAY;
-      }
-      break;
-
-    case Voice::ENV_DECAY:
-      v.envLevel -= dt * (1.0f - sustainLevel) / decayTime;
-      if (v.envLevel <= sustainLevel) {
-        v.envLevel = sustainLevel;
-        v.envStage = Voice::ENV_SUSTAIN;
-      }
-      break;
-
-    case Voice::ENV_SUSTAIN:
-      v.envLevel = sustainLevel;
-      break;
-
-    case Voice::ENV_RELEASE:
-      v.envLevel -= dt / releaseTime;
-      if (v.envLevel <= 0.0f) {
-        v.envLevel = 0.0f;
-        v.active = false;
-        v.envStage = Voice::ENV_OFF;
-      }
-      break;
-
-    case Voice::ENV_OFF:
-      v.active = false;
-      break;
+  if (currentBase == BASE_SUS && currentMods == (MOD_6 | MOD_m7 | MOD_9)) {
+    snprintf(out, cap, "%ssusJAZZ", rn); return;
   }
-}
-
-float generateSample(Voice& v) {
-  float sample = 0.0f;
-
-  switch (currentEngine) {
-    case ENGINE_VIRTUAL_ANALOG:
-      sample = generateVirtualAnalog(v);
-      break;
-    case ENGINE_FM:
-      sample = generateFM(v);
-      break;
-    case ENGINE_LEAD_PIANO:
-      sample = generateLeadPiano(v);
-      break;
+  if (currentBase == BASE_DIM && currentMods == (MOD_6 | MOD_m7 | MOD_9)) {
+    snprintf(out, cap, "%sdimJAZZ", rn); return;
+  }
+  if (currentBase == BASE_DIM && currentMods == (MOD_M7 | MOD_m7 | MOD_6 | MOD_9)) {
+    snprintf(out, cap, "%sdimWTF", rn); return;
   }
 
-  return sample * v.amplitude * v.envLevel;
+  char suffix[16];
+  int p = 0;
+  if (currentMods & MOD_M7) { suffix[p++] = 'M'; suffix[p++] = '7'; }
+  if (currentMods & MOD_m7) {
+    if (currentBase == BASE_SUS) { suffix[p++] = 'm'; suffix[p++] = '7'; }
+    else                          { suffix[p++] = '7'; }
+  }
+  if (currentMods & MOD_6) suffix[p++] = '6';
+  if (currentMods & MOD_9) suffix[p++] = '9';
+  suffix[p] = 0;
+
+  snprintf(out, cap, "%s%s%s", rn, baseSuffix[currentBase], suffix);
 }
 
-// ==== Chord Generation ====
-
-void playChord(uint8_t root, ChordType type, uint8_t velocity) {
-  allNotesOff();
-
-  // Play chord notes
-  for (int i = 0; i < 6; i++) {
-    int8_t interval = chordIntervals[type][i];
-    if (interval < 0) break;
-
-    uint8_t note = root + interval;
-    if (note > 0 && note < 128) {
-      noteOn(note, velocity);
-    }
-  }
-
-  // Play bass note if enabled
-  if (bassEnabled && root >= 24) {
-    bassNote = root - 12; // One octave down
-    noteOn(bassNote, velocity);
-  }
-}
+// ==== Playback ====
 
 void stopChord() {
-  allNotesOff();
+  if (arpNoteActive) {
+    sendNoteOff(MIDI_CH_CHORD, arpCurrentNote);
+    arpNoteActive = false;
+  }
+  for (uint8_t i = 0; i < activeChordCount; i++) {
+    sendNoteOff(MIDI_CH_CHORD, activeChordNotes[i]);
+  }
+  activeChordCount = 0;
+
+  arpNoteCount = 0;
+  arpIndex = 0;
+  strumActive = false;
+  strumCount = strumIndex = 0;
+
+  if (bassNoteActive) {
+    sendNoteOff(MIDI_CH_BASS, activeBassNote);
+    bassNoteActive = false;
+  }
 }
 
-// ==== MIDI Functions ====
+bool chordIsSounding() {
+  return activeChordCount > 0 || arpNoteActive || strumActive;
+}
+
+// Helper to choose an initial velocity per mode (Slop randomises).
+static inline uint8_t pickStrumVelocity(uint8_t base) {
+  if (strumMode == PERF_SLOP) return (uint8_t)random(70, 121);
+  return base;
+}
+
+// Stash `notes` into the strum queue and emit the first note immediately.
+// strumMode records which performance mode owns this strum so the tick code
+// can apply per-mode timing / jitter.
+static void startStrum(const uint8_t* notes, int n, uint8_t velocity, PerfMode mode) {
+  strumMode = mode;
+  strumCount = (uint8_t)((n < MAX_NOTES) ? n : MAX_NOTES);
+  for (uint8_t i = 0; i < strumCount; i++) strumNotes[i] = notes[i];
+  strumIndex = 0;
+  if (strumCount > 0) {
+    uint8_t v = pickStrumVelocity(velocity);
+    sendNoteOn(MIDI_CH_CHORD, strumNotes[0], v);
+    activeChordNotes[activeChordCount++] = strumNotes[0];
+    strumIndex = 1;
+    strumLastEmitMs = millis();
+  }
+  strumActive = (strumIndex < strumCount);
+}
+
+static void startArp(const uint8_t* notes, int n, uint8_t velocity, PerfMode mode) {
+  arpMode = mode;
+  arpNoteCount = (uint8_t)((n < MAX_NOTES) ? n : MAX_NOTES);
+  for (uint8_t i = 0; i < arpNoteCount; i++) arpNotes[i] = notes[i];
+  arpIndex = 0;
+  patternStep = 0;
+  uint8_t first;
+  if (arpMode == PERF_PATTERN && arpNoteCount > 0) {
+    first = arpNotes[patternSeq[0] % arpNoteCount];
+  } else {
+    first = arpNotes[0];
+  }
+  arpCurrentNote = first;
+  sendNoteOn(MIDI_CH_CHORD, arpCurrentNote, velocity);
+  arpNoteActive = true;
+  arpLastTickMs = millis();
+}
+
+void playChord(uint8_t root, uint8_t velocity) {
+  stopChord();
+
+  uint8_t notes[MAX_NOTES];
+  int n = buildBaseChordNotes(root, notes);
+  if (n <= 0) return;
+
+  switch (currentPerfMode) {
+    case PERF_STRUM:
+      startStrum(notes, n, velocity, PERF_STRUM);
+      break;
+    case PERF_STRUM_2OCT:
+      n = expandTwoOctaves(notes, n);
+      startStrum(notes, n, velocity, PERF_STRUM_2OCT);
+      break;
+    case PERF_SLOP:
+      startStrum(notes, n, velocity, PERF_SLOP);
+      break;
+    case PERF_HARP:
+      n = expandHarp(notes, n);
+      startStrum(notes, n, velocity, PERF_HARP);
+      break;
+
+    case PERF_ARP:
+      startArp(notes, n, velocity, PERF_ARP);
+      break;
+    case PERF_ARP_2OCT:
+      n = expandTwoOctaves(notes, n);
+      startArp(notes, n, velocity, PERF_ARP_2OCT);
+      break;
+    case PERF_PATTERN:
+      startArp(notes, n, velocity, PERF_PATTERN);
+      break;
+
+    default: {
+      for (int i = 0; i < n; i++) {
+        sendNoteOn(MIDI_CH_CHORD, notes[i], velocity);
+        activeChordNotes[activeChordCount++] = notes[i];
+      }
+    }
+  }
+
+  if (bassEnabled && root >= 24) {
+    activeBassNote = (uint8_t)(root - 12);
+    sendNoteOn(MIDI_CH_BASS, activeBassNote, velocity);
+    bassNoteActive = true;
+  }
+}
+
+void retriggerIfActive() {
+  if (chordIsSounding()) playChord(rootNote, 100);
+}
+
+// Per-mode emission rate for the strum queue (ms between successive notes).
+// Each mode picks a different range so they're audibly distinct, then Slop
+// adds jitter on top.
+static uint32_t strumIntervalMs() {
+  uint32_t base;
+  switch (strumMode) {
+    case PERF_HARP:
+      // Harp glissando: very fast, 6–28 ms regardless of perfParam.
+      base = (uint32_t)(28.0f - 22.0f * perfParam);
+      if (base < 6) base = 6;
+      break;
+    case PERF_SLOP:
+      // Strum-ish, but a bit slower default to leave room for jitter to swing.
+      base = (uint32_t)(220.0f - 200.0f * perfParam);
+      if (base < 10) base = 10;
+      break;
+    case PERF_STRUM_2OCT:
+      // Slightly tighter than Strum so the doubled note count doesn't drag.
+      base = (uint32_t)(160.0f - 150.0f * perfParam);
+      if (base < 5) base = 5;
+      break;
+    case PERF_STRUM:
+    default:
+      base = (uint32_t)(200.0f - 195.0f * perfParam);
+      if (base < 5) base = 5;
+      break;
+  }
+  if (strumMode == PERF_SLOP) {
+    // ±60% jitter — looser than Strum so the swing is obvious.
+    int span = (int)(base * 6 / 10);
+    if (span < 2) span = 2;
+    int jitter = (int)random(-span, span + 1);
+    int v = (int)base + jitter;
+    if (v < 5) v = 5;
+    base = (uint32_t)v;
+  }
+  return base;
+}
+
+void tickStrum() {
+  if (!strumActive || strumIndex >= strumCount) { strumActive = false; return; }
+  uint32_t now = millis();
+  if (now - strumLastEmitMs < strumIntervalMs()) return;
+  uint8_t note = strumNotes[strumIndex];
+  uint8_t vel = (strumMode == PERF_SLOP) ? (uint8_t)random(70, 121) : 100;
+  sendNoteOn(MIDI_CH_CHORD, note, vel);
+  if (activeChordCount < MAX_NOTES) {
+    activeChordNotes[activeChordCount++] = note;
+  }
+  strumIndex++;
+  strumLastEmitMs = now;
+  if (strumIndex >= strumCount) strumActive = false;
+}
+
+void tickArp() {
+  if (!arpNoteActive || arpNoteCount == 0) return;
+  uint32_t now = millis();
+  // 16th-note from BPM, then perfParam shrinks the interval up to ~4×.
+  uint32_t base16 = 60000UL / ((uint32_t)bpm * 4);
+  uint32_t interval = (uint32_t)((float)base16 / (0.25f + perfParam * 1.5f));
+  if (interval < 25) interval = 25;
+  if (now - arpLastTickMs < interval) return;
+
+  sendNoteOff(MIDI_CH_CHORD, arpCurrentNote);
+
+  if (arpMode == PERF_PATTERN) {
+    // Step through the fixed pattern sequence (indices into the chord notes),
+    // so Pattern doesn't sound like a plain ascending arpeggio.
+    patternStep = (patternStep + 1) % PATTERN_LEN;
+    uint8_t idx = (uint8_t)(patternSeq[patternStep] % arpNoteCount);
+    arpCurrentNote = arpNotes[idx];
+  } else {
+    // Straight ascending arpeggio (Arp / Arp 2 oct).
+    arpIndex = (uint8_t)((arpIndex + 1) % arpNoteCount);
+    arpCurrentNote = arpNotes[arpIndex];
+  }
+
+  sendNoteOn(MIDI_CH_CHORD, arpCurrentNote, 100);
+  arpLastTickMs = now;
+}
+
+// ==== Header stepper helpers ====
+void stepProgram(int delta) {
+  int p = (int)currentProgram + delta;
+  if (p < 0)   p = 0;
+  if (p > 127) p = 127;
+  if ((uint8_t)p == currentProgram) return;
+  currentProgram = (uint8_t)p;
+  applyChordProgram();
+  drawHeader();
+}
+void stepBpm(int delta) {
+  int b = (int)bpm + delta * 5;
+  if (b < 40)  b = 40;
+  if (b > 240) b = 240;
+  bpm = (uint16_t)b;
+  drawHeader();
+}
+void cyclePerfMode() {
+  currentPerfMode = (PerfMode)((currentPerfMode + 1) % PERF_COUNT);
+  drawHeaderToggles();
+  drawChordNameDisplay();
+  retriggerIfActive();
+}
 
 void loadPreset(uint8_t presetNum) {
   if (presetNum >= PRESET_COUNT) return;
-
   const Preset& p = presets[presetNum];
-  currentEngine = p.engine;
-  delayMix = p.delay;
-  reverbMix = p.reverb;
-  chorusMix = p.chorus;
-  bassEnabled = p.bass;
-  currentPreset = presetNum;
-
-  // Redraw UI
+  currentProgram = p.program;
+  reverbMix      = p.reverb;
+  chorusMix      = p.chorus;
+  bassEnabled    = p.bass;
+  currentPreset  = presetNum;
+  applyChordProgram();
+  applyMixEffects();
   drawUI();
 }
 
-void handleProgramChange(uint8_t channel, uint8_t program) {
-  if (program <= 2) {
-    // PC 0-2: Synth engines
-    currentEngine = (SynthEngine)program;
-    drawEngineSelector();
-  } else if (program >= 10 && program < 10 + CHORD_COUNT) {
-    // PC 10-19: Chord types
-    currentChordType = (ChordType)(program - 10);
-    drawChordTypeButtons();
-  } else if (program == 100) {
-    // PC 100: Bass ON
-    bassEnabled = true;
-    drawBassToggle();
-  } else if (program == 101) {
-    // PC 101: Bass OFF
-    bassEnabled = false;
-    drawBassToggle();
-  } else if (program >= 110 && program < 110 + PRESET_COUNT) {
-    // PC 110-127: Presets
-    loadPreset(program - 110);
-  }
-}
-
+// ==== MIDI IN (intentionally inert) ====
 void processMIDI() {
-  static uint8_t midiStatus = 0;
-  static uint8_t midiData1 = 0;
-  static uint8_t midiRunningStatus = 0;
-
-  while (Serial2.available()) {
-    uint8_t b = Serial2.read();
-    midiInCount++;
-
-    if (b & 0x80) {
-      // Status byte
-      midiStatus = b;
-      midiRunningStatus = b;
-      midiData1 = 0;
-    } else {
-      // Data byte
-      if (midiStatus == 0 && midiRunningStatus != 0) {
-        midiStatus = midiRunningStatus;
-      }
-
-      uint8_t msgType = midiStatus & 0xF0;
-      uint8_t channel = midiStatus & 0x0F;
-
-      if (msgType == 0xC0) {
-        // Program Change (1 data byte)
-        handleProgramChange(channel, b);
-        midiStatus = 0;
-      } else if (msgType == 0x90) {
-        // Note On (2 data bytes)
-        if (midiData1 == 0) {
-          midiData1 = b;
-        } else {
-          if (b > 0) {
-            // Note On with velocity
-            rootNote = midiData1;
-            playChord(rootNote, currentChordType, b);
-          } else {
-            // Note On with velocity 0 = Note Off
-            stopChord();
-          }
-          midiStatus = 0;
-          midiData1 = 0;
-        }
-      } else if (msgType == 0x80) {
-        // Note Off (2 data bytes)
-        if (midiData1 == 0) {
-          midiData1 = b;
-        } else {
-          stopChord();
-          midiStatus = 0;
-          midiData1 = 0;
-        }
-      } else if (msgType == 0xB0) {
-        // Control Change (2 data bytes) - for future use
-        if (midiData1 == 0) {
-          midiData1 = b;
-        } else {
-          midiStatus = 0;
-          midiData1 = 0;
-        }
-      } else {
-        // Other messages - ignore for now
-        midiStatus = 0;
-        midiData1 = 0;
-      }
-    }
-  }
+  while (Serial2.available()) (void)Serial2.read();
 }
 
-// ==== UI Drawing ====
+// ==== UI drawing ====
 
 void drawPianoKeyboard() {
-  const int keyY = 250;
-  const int whiteKeyW = 90;
-  const int whiteKeyH = 200;
-  const int blackKeyW = 60;
-  const int blackKeyH = 120;
+  const int keyY  = PIANO_Y;
+  const int wW    = PIANO_WHITE_W;
+  const int wH    = PIANO_WHITE_H;
+  const int bW    = PIANO_BLACK_W;
+  const int bH    = PIANO_BLACK_H;
+  const int startX = RIGHT_X + (RIGHT_W - 8 * wW) / 2;
 
-  int startX = 50;
-  int whiteKeyIndex = 0;
+  const bool    blackPat[] = {false,true,false,true,false,false,true,false,true,false,true,false,false};
+  const uint8_t offsets[]  = {0,1,2,3,4,5,6,7,8,9,10,11,12};
 
-  // Note pattern: C, C#, D, D#, E, F, F#, G, G#, A, A#, B, C
-  const bool blackKeyPattern[] = {false, true, false, true, false, false, true, false, true, false, true, false, false};
-  const uint8_t noteOffsets[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
-
-  // Draw white keys first
+  int whiteIdx = 0;
   for (int i = 0; i < 13; i++) {
-    if (!blackKeyPattern[i]) {
-      int x = startX + whiteKeyIndex * whiteKeyW;
-      M5.Lcd.fillRect(x, keyY, whiteKeyW - 2, whiteKeyH, COL_WHITEKEY);
-      M5.Lcd.drawRect(x, keyY, whiteKeyW - 2, whiteKeyH, TFT_DARKGREY);
-
-      pianoKeys[i].r = {x, keyY, whiteKeyW - 2, whiteKeyH};
-      pianoKeys[i].note = 60 + noteOffsets[i]; // Middle C octave
+    if (!blackPat[i]) {
+      int x = startX + whiteIdx * wW;
+      M5.Lcd.fillRect(x, keyY, wW - 2, wH, COL_WHITEKEY);
+      M5.Lcd.drawRect(x, keyY, wW - 2, wH, TFT_DARKGREY);
+      pianoKeys[i].r = {x, keyY, wW - 2, wH};
+      pianoKeys[i].note = 60 + offsets[i];
       pianoKeys[i].isBlack = false;
-
-      whiteKeyIndex++;
+      whiteIdx++;
     }
   }
-
-  // Draw black keys on top
-  whiteKeyIndex = 0;
+  whiteIdx = 0;
   for (int i = 0; i < 13; i++) {
-    if (blackKeyPattern[i]) {
-      int x = startX + whiteKeyIndex * whiteKeyW - blackKeyW / 2;
-      M5.Lcd.fillRect(x, keyY, blackKeyW, blackKeyH, COL_BLACKKEY);
-      M5.Lcd.drawRect(x, keyY, blackKeyW, blackKeyH, TFT_BLACK);
-
-      pianoKeys[i].r = {x, keyY, blackKeyW, blackKeyH};
-      pianoKeys[i].note = 60 + noteOffsets[i];
+    if (blackPat[i]) {
+      int x = startX + whiteIdx * wW - bW / 2;
+      M5.Lcd.fillRect(x, keyY, bW, bH, COL_BLACKKEY);
+      M5.Lcd.drawRect(x, keyY, bW, bH, TFT_BLACK);
+      pianoKeys[i].r = {x, keyY, bW, bH};
+      pianoKeys[i].note = 60 + offsets[i];
       pianoKeys[i].isBlack = true;
     } else {
-      whiteKeyIndex++;
+      whiteIdx++;
     }
   }
 }
 
-void drawChordTypeButtons() {
-  const int btnW = 120;
-  const int btnH = 60;
-  const int spacing = 10;
-  const int startX = 50;
-  const int startY = 480;
+void drawChordPad() {
+  const int btnW = (CHORD_PAD_W - 3 * 10) / 4;
 
-  for (int i = 0; i < CHORD_COUNT; i++) {
-    int col = i % 5;
-    int row = i / 5;
-    int x = startX + col * (btnW + spacing);
-    int y = startY + row * (btnH + spacing);
-
-    chordTypeButtons[i] = {x, y, btnW, btnH};
-
-    uint16_t color = (currentChordType == i) ? COL_BTN_ACTIVE : COL_BTN;
-    M5.Lcd.fillRoundRect(x, y, btnW, btnH, 8, color);
-    M5.Lcd.drawRoundRect(x, y, btnW, btnH, 8, TFT_WHITE);
-
-    M5.Lcd.setFont(FONT_SMALL);
+  for (int i = 0; i < BASE_COUNT; i++) {
+    int x = CHORD_PAD_X + i * (btnW + 10);
+    int y = BASE_BTN_Y;
+    chordBaseButtons[i] = {x, y, btnW, BASE_BTN_H};
+    uint16_t color = (currentBase == i) ? COL_BTN_ACTIVE : COL_BTN;
+    M5.Lcd.fillRoundRect(x, y, btnW, BASE_BTN_H, 12, color);
+    M5.Lcd.drawRoundRect(x, y, btnW, BASE_BTN_H, 12, TFT_WHITE);
+    M5.Lcd.setFont(FONT_LARGE);
     M5.Lcd.setTextColor(COL_BTN_TXT);
     M5.Lcd.setTextDatum(middle_center);
-    M5.Lcd.drawString(chordNames[i], x + btnW / 2, y + btnH / 2);
+    M5.Lcd.drawString(baseLabels[i], x + btnW / 2, y + BASE_BTN_H / 2);
+  }
+
+  for (int i = 0; i < 4; i++) {
+    int x = CHORD_PAD_X + i * (btnW + 10);
+    int y = MOD_BTN_Y;
+    chordModButtons[i] = {x, y, btnW, MOD_BTN_H};
+    bool on = (currentMods & modFlags[i]) != 0;
+    uint16_t color = on ? COL_BTN_ACTIVE : COL_BTN;
+    M5.Lcd.fillRoundRect(x, y, btnW, MOD_BTN_H, 12, color);
+    M5.Lcd.drawRoundRect(x, y, btnW, MOD_BTN_H, 12, TFT_WHITE);
+    M5.Lcd.setFont(FONT_TITLE);
+    M5.Lcd.setTextColor(COL_BTN_TXT);
+    M5.Lcd.setTextDatum(middle_center);
+    M5.Lcd.drawString(modLabels[i], x + btnW / 2, y + MOD_BTN_H / 2);
   }
 }
 
-void drawEngineSelector() {
-  const char* engineNames[] = {"Analog", "FM", "Piano"};
-  const int btnW = 150;
-  const int btnH = 50;
-  const int spacing = 10;
-  const int startX = 50;
-  const int startY = 30;
+void drawChordNameDisplay() {
+  // Clear the whole row first so the perf label doesn't leave artefacts
+  M5.Lcd.fillRect(CHORD_NAME_X, CHORD_NAME_Y, RIGHT_X + RIGHT_W - CHORD_NAME_X, CHORD_NAME_H, COL_BG);
 
+  // Chord name panel
+  M5.Lcd.fillRoundRect(CHORD_NAME_X, CHORD_NAME_Y, CHORD_NAME_W, CHORD_NAME_H, 14, COL_PANEL);
+  M5.Lcd.drawRoundRect(CHORD_NAME_X, CHORD_NAME_Y, CHORD_NAME_W, CHORD_NAME_H, 14, TFT_WHITE);
+  char name[24];
+  buildChordName(name, sizeof(name));
   M5.Lcd.setFont(FONT_TITLE);
   M5.Lcd.setTextColor(COL_ACCENT);
-  M5.Lcd.setTextDatum(top_left);
-  M5.Lcd.drawString("Orchid Synth", startX, startY);
+  M5.Lcd.setTextDatum(middle_center);
+  M5.Lcd.drawString(name, CHORD_NAME_X + CHORD_NAME_W / 2, CHORD_NAME_Y + CHORD_NAME_H / 2);
 
-  // Display current preset name
-  if (currentPreset < PRESET_COUNT) {
-    M5.Lcd.setFont(FONT_SMALL);
-    M5.Lcd.setTextColor(COL_VALUE);
-    M5.Lcd.drawString(presets[currentPreset].name, startX + 250, startY + 10);
-  }
+  // Perf-mode label panel (read-only; the PERF button in the toggle row cycles it)
+  M5.Lcd.fillRoundRect(PERF_LBL_X, CHORD_NAME_Y, PERF_LBL_W, CHORD_NAME_H, 14, COL_PANEL);
+  M5.Lcd.drawRoundRect(PERF_LBL_X, CHORD_NAME_Y, PERF_LBL_W, CHORD_NAME_H, 14, TFT_WHITE);
+  M5.Lcd.setFont(FONT_LARGE);
+  M5.Lcd.setTextColor(COL_VALUE);
+  M5.Lcd.setTextDatum(middle_center);
+  M5.Lcd.drawString(perfModeNames[currentPerfMode],
+                    PERF_LBL_X + PERF_LBL_W / 2, CHORD_NAME_Y + CHORD_NAME_H / 2);
+}
 
-  // MIDI activity indicator
-  static unsigned long lastMidiTime = 0;
-  if (midiInCount > 0 && millis() - lastMidiTime < 100) {
-    M5.Lcd.fillCircle(startX + 450, startY + 20, 10, TFT_GREEN);
+static void drawSlider(int idx, const char* label, float value, bool bipolar) {
+  int y = LEFT_EFX_Y + idx * (EFX_SLIDER_H + EFX_GAP);
+  int x = CHORD_PAD_X;
+  int w = CHORD_PAD_W;
+  int h = EFX_SLIDER_H;
+  effectSliders[idx] = {x, y, w, h};
+
+  M5.Lcd.fillRoundRect(x, y, w, h, 10, COL_PANEL);
+  M5.Lcd.drawRoundRect(x, y, w, h, 10, TFT_WHITE);
+
+  if (bipolar) {
+    int cx = x + w / 2;
+    if (value < 0.5f) {
+      int fillW = (int)((0.5f - value) * w);
+      if (fillW > 0) M5.Lcd.fillRoundRect(cx - fillW, y, fillW, h, 8, COL_ACCENT);
+    } else if (value > 0.5f) {
+      int fillW = (int)((value - 0.5f) * w);
+      if (fillW > 0) M5.Lcd.fillRoundRect(cx, y, fillW, h, 8, COL_ACCENT);
+    }
+    M5.Lcd.drawFastVLine(cx, y + 4, h - 8, TFT_WHITE);
   } else {
-    M5.Lcd.fillCircle(startX + 450, startY + 20, 10, COL_PANEL);
+    int fillW = (int)(w * value);
+    if (fillW > 0) M5.Lcd.fillRoundRect(x, y, fillW, h, 10, COL_ACCENT);
   }
-  if (midiInCount > 0) lastMidiTime = millis();
 
-  M5.Lcd.setFont(FONT_SMALL);
-  M5.Lcd.setTextColor(COL_MUTED);
-  M5.Lcd.setTextDatum(top_left);
-  M5.Lcd.drawString("MIDI", startX + 470, startY + 12);
+  M5.Lcd.setFont(FONT_MED);
+  M5.Lcd.setTextColor(COL_BTN_TXT);
+  M5.Lcd.setTextDatum(middle_left);
+  M5.Lcd.drawString(label, x + 14, y + h / 2);
 
-  for (int i = 0; i < 3; i++) {
-    int x = startX + i * (btnW + spacing);
-    int y = startY + 60;
-
-    engineButtons[i] = {x, y, btnW, btnH};
-
-    uint16_t color = (currentEngine == i) ? COL_BTN_ACTIVE : COL_BTN;
-    M5.Lcd.fillRoundRect(x, y, btnW, btnH, 8, color);
-    M5.Lcd.drawRoundRect(x, y, btnW, btnH, 8, TFT_WHITE);
-
-    M5.Lcd.setFont(FONT_MED);
-    M5.Lcd.setTextColor(COL_BTN_TXT);
-    M5.Lcd.setTextDatum(middle_center);
-    M5.Lcd.drawString(engineNames[i], x + btnW / 2, y + btnH / 2);
+  char valStr[16];
+  if (bipolar) {
+    int pct = (int)((value - 0.5f) * 200.0f);
+    snprintf(valStr, sizeof(valStr), "%+d%%", pct);
+  } else {
+    snprintf(valStr, sizeof(valStr), "%.0f%%", value * 100.0f);
   }
+  M5.Lcd.setTextDatum(middle_right);
+  M5.Lcd.drawString(valStr, x + w - 14, y + h / 2);
 }
 
 void drawEffectsPanel() {
-  const char* effectNames[] = {"Delay", "Reverb", "Chorus"};
-  const int sliderX = 800;
-  const int sliderY = 30;
-  const int sliderW = 400;
-  const int sliderH = 40;
-  const int spacing = 60;
-
-  M5.Lcd.setFont(FONT_LARGE);
-  M5.Lcd.setTextColor(COL_ACCENT);
-  M5.Lcd.setTextDatum(top_left);
-  M5.Lcd.drawString("Effects", sliderX, sliderY);
-
-  float* effectValues[] = {&delayMix, &reverbMix, &chorusMix};
-
-  for (int i = 0; i < 3; i++) {
-    int y = sliderY + 50 + i * spacing;
-
-    effectSliders[i] = {sliderX, y, sliderW, sliderH};
-
-    // Draw slider background
-    M5.Lcd.fillRoundRect(sliderX, y, sliderW, sliderH, 8, COL_PANEL);
-    M5.Lcd.drawRoundRect(sliderX, y, sliderW, sliderH, 8, TFT_WHITE);
-
-    // Draw fill
-    int fillW = (int)(sliderW * (*effectValues[i]));
-    M5.Lcd.fillRoundRect(sliderX, y, fillW, sliderH, 8, COL_ACCENT);
-
-    // Draw label
-    M5.Lcd.setFont(FONT_SMALL);
-    M5.Lcd.setTextColor(COL_BTN_TXT);
-    M5.Lcd.setTextDatum(middle_left);
-    M5.Lcd.drawString(effectNames[i], sliderX + 10, y + sliderH / 2);
-
-    // Draw value
-    char valStr[16];
-    sprintf(valStr, "%.0f%%", (*effectValues[i]) * 100);
-    M5.Lcd.setTextDatum(middle_right);
-    M5.Lcd.drawString(valStr, sliderX + sliderW - 10, y + sliderH / 2);
-  }
+  drawSlider(0, "Perf",   perfParam, false);
+  drawSlider(1, "Bend",   bendValue, true);
+  drawSlider(2, "Reverb", reverbMix, false);
+  drawSlider(3, "Chorus", chorusMix, false);
 }
 
-void drawBassToggle() {
-  const int btnX = 800;
-  const int btnY = 250;
-  const int btnW = 180;
-  const int btnH = 80;
-
-  uint16_t color = bassEnabled ? COL_BTN_ACTIVE : COL_BTN;
-  M5.Lcd.fillRoundRect(btnX, btnY, btnW, btnH, 8, color);
-  M5.Lcd.drawRoundRect(btnX, btnY, btnW, btnH, 8, TFT_WHITE);
-
+static void drawHeaderBtn(const Rect& r, bool on, const char* label) {
+  M5.Lcd.fillRoundRect(r.x, r.y, r.w, r.h, 12, on ? COL_BTN_ACTIVE : COL_BTN);
+  M5.Lcd.drawRoundRect(r.x, r.y, r.w, r.h, 12, TFT_WHITE);
   M5.Lcd.setFont(FONT_LARGE);
   M5.Lcd.setTextColor(COL_BTN_TXT);
   M5.Lcd.setTextDatum(middle_center);
-  M5.Lcd.drawString("BASS", btnX + btnW / 2, btnY + btnH / 2);
+  M5.Lcd.drawString(label, r.x + r.w / 2, r.y + r.h / 2);
+}
+
+void drawHeaderToggles() {
+  drawHeaderBtn(bassToggleRect, bassEnabled, "BASS");
+
+  // PERF button: shows "PERF: <mode name>"
+  char buf[40];
+  snprintf(buf, sizeof(buf), "PERF: %s", perfModeNames[currentPerfMode]);
+  drawHeaderBtn(perfToggleRect, true, buf);
+}
+
+void drawHeader() {
+  M5.Lcd.fillRect(RIGHT_X, 0, RIGHT_W, CHORD_NAME_Y - 4, COL_BG);
+
+  drawHeaderBtn(bpmDownBtn, false, "-");
+  M5.Lcd.fillRoundRect(bpmDisplayRect.x, bpmDisplayRect.y, bpmDisplayRect.w, bpmDisplayRect.h, 12, COL_PANEL);
+  M5.Lcd.drawRoundRect(bpmDisplayRect.x, bpmDisplayRect.y, bpmDisplayRect.w, bpmDisplayRect.h, 12, TFT_WHITE);
+  char bpmBuf[16];
+  snprintf(bpmBuf, sizeof(bpmBuf), "BPM %u", (unsigned)bpm);
+  M5.Lcd.setFont(FONT_LARGE);
+  M5.Lcd.setTextColor(COL_VALUE);
+  M5.Lcd.setTextDatum(middle_center);
+  M5.Lcd.drawString(bpmBuf, bpmDisplayRect.x + bpmDisplayRect.w / 2,
+                    bpmDisplayRect.y + bpmDisplayRect.h / 2);
+  drawHeaderBtn(bpmUpBtn, false, "+");
+
+  M5.Lcd.fillRoundRect(presetDisplayRect.x, presetDisplayRect.y, presetDisplayRect.w, presetDisplayRect.h, 12, COL_PANEL);
+  M5.Lcd.drawRoundRect(presetDisplayRect.x, presetDisplayRect.y, presetDisplayRect.w, presetDisplayRect.h, 12, TFT_WHITE);
+  if (currentPreset < PRESET_COUNT) {
+    M5.Lcd.setFont(FONT_MED);
+    M5.Lcd.setTextColor(COL_MUTED);
+    M5.Lcd.setTextDatum(middle_center);
+    M5.Lcd.drawString(presets[currentPreset].name,
+                      presetDisplayRect.x + presetDisplayRect.w / 2,
+                      presetDisplayRect.y + presetDisplayRect.h / 2);
+  }
+
+  drawHeaderBtn(prgDownBtn, false, "PRG-");
+  M5.Lcd.fillRoundRect(prgDisplayRect.x, prgDisplayRect.y, prgDisplayRect.w, prgDisplayRect.h, 12, COL_PANEL);
+  M5.Lcd.drawRoundRect(prgDisplayRect.x, prgDisplayRect.y, prgDisplayRect.w, prgDisplayRect.h, 12, TFT_WHITE);
+  char prgBuf[48];
+  snprintf(prgBuf, sizeof(prgBuf), "%03u  %s",
+           (unsigned)(currentProgram + 1), kGmInstrumentNames[currentProgram]);
+  M5.Lcd.setFont(FONT_LARGE);
+  M5.Lcd.setTextColor(COL_VALUE);
+  M5.Lcd.setTextDatum(middle_left);
+  M5.Lcd.drawString(prgBuf, prgDisplayRect.x + 16,
+                    prgDisplayRect.y + prgDisplayRect.h / 2);
+  drawHeaderBtn(prgUpBtn, false, "PRG+");
+
+  drawHeaderToggles();
 }
 
 void drawUI() {
   M5.Lcd.fillScreen(COL_BG);
-
-  drawEngineSelector();
+  drawHeader();
+  drawChordPad();
+  drawChordNameDisplay();
   drawEffectsPanel();
   drawPianoKeyboard();
-  drawChordTypeButtons();
-  drawBassToggle();
 }
 
-// ==== Touch Handling ====
-
+// ==== Touch dispatch ====
 bool touchInRect(int tx, int ty, const Rect& r) {
   return (tx >= r.x && tx < r.x + r.w && ty >= r.y && ty < r.y + r.h);
 }
 
-void handleTouch(int tx, int ty) {
-  // Check piano keys
-  for (int i = 12; i >= 0; i--) { // Check black keys first (drawn on top)
+bool handleTouchPress(int tx, int ty) {
+  // Piano keys (black first)
+  for (int i = 12; i >= 0; i--) {
     if (pianoKeys[i].isBlack && touchInRect(tx, ty, pianoKeys[i].r)) {
       rootNote = pianoKeys[i].note;
-      playChord(rootNote, currentChordType, 100);
-      return;
+      drawChordNameDisplay();
+      playChord(rootNote, 100);
+      return true;
     }
   }
   for (int i = 0; i < 13; i++) {
     if (!pianoKeys[i].isBlack && touchInRect(tx, ty, pianoKeys[i].r)) {
       rootNote = pianoKeys[i].note;
-      playChord(rootNote, currentChordType, 100);
-      return;
+      drawChordNameDisplay();
+      playChord(rootNote, 100);
+      return true;
     }
   }
 
-  // Check chord type buttons
-  for (int i = 0; i < CHORD_COUNT; i++) {
-    if (touchInRect(tx, ty, chordTypeButtons[i])) {
-      currentChordType = (ChordType)i;
-      drawChordTypeButtons();
-      return;
+  // Chord base (radio)
+  for (int i = 0; i < BASE_COUNT; i++) {
+    if (touchInRect(tx, ty, chordBaseButtons[i])) {
+      currentBase = (ChordBase)i;
+      drawChordPad();
+      drawChordNameDisplay();
+      retriggerIfActive();
+      return false;
     }
   }
 
-  // Check engine buttons
-  for (int i = 0; i < 3; i++) {
-    if (touchInRect(tx, ty, engineButtons[i])) {
-      currentEngine = (SynthEngine)i;
-      drawEngineSelector();
-      return;
+  // Modifiers (toggle)
+  for (int i = 0; i < 4; i++) {
+    if (touchInRect(tx, ty, chordModButtons[i])) {
+      currentMods ^= modFlags[i];
+      drawChordPad();
+      drawChordNameDisplay();
+      retriggerIfActive();
+      return false;
     }
   }
 
-  // Check bass toggle
-  if (touchInRect(tx, ty, {800, 250, 180, 80})) {
+  // Header steppers
+  if (touchInRect(tx, ty, prgDownBtn)) { stepProgram(-1); return false; }
+  if (touchInRect(tx, ty, prgUpBtn))   { stepProgram(+1); return false; }
+  if (touchInRect(tx, ty, bpmDownBtn)) { stepBpm(-1);     return false; }
+  if (touchInRect(tx, ty, bpmUpBtn))   { stepBpm(+1);     return false; }
+
+  if (touchInRect(tx, ty, bassToggleRect)) {
     bassEnabled = !bassEnabled;
-    drawBassToggle();
-    return;
+    if (!bassEnabled && bassNoteActive) {
+      sendNoteOff(MIDI_CH_BASS, activeBassNote);
+      bassNoteActive = false;
+    } else if (bassEnabled && chordIsSounding() && rootNote >= 24 && !bassNoteActive) {
+      activeBassNote = (uint8_t)(rootNote - 12);
+      sendNoteOn(MIDI_CH_BASS, activeBassNote, 100);
+      bassNoteActive = true;
+    }
+    drawHeaderToggles();
+    return false;
+  }
+  if (touchInRect(tx, ty, perfToggleRect)) {
+    cyclePerfMode();
+    return false;
   }
 
-  // Check effect sliders (simple on/off for now)
-  for (int i = 0; i < 3; i++) {
-    if (touchInRect(tx, ty, effectSliders[i])) {
-      float* effectValue = (i == 0) ? &delayMix : (i == 1) ? &reverbMix : &chorusMix;
-      float relativeX = (tx - effectSliders[i].x) / (float)effectSliders[i].w;
-      *effectValue = constrain(relativeX, 0.0f, 1.0f);
-      drawEffectsPanel();
-      return;
-    }
-  }
+  return false;  // sliders are handled in updateSliderDrag()
 }
 
-void handleTouchRelease() {
-  stopChord();
+bool anyTouchOnPiano() {
+  int n = M5.Touch.getCount();
+  for (int i = 0; i < n; i++) {
+    auto t = M5.Touch.getDetail(i);
+    if (!t.isPressed()) continue;
+    for (int k = 0; k < 13; k++) {
+      if (touchInRect(t.x, t.y, pianoKeys[k].r)) return true;
+    }
+  }
+  return false;
+}
+
+// Continuous slider tracking. Only the Bend slider (index 1) springs back.
+void updateSliderDrag() {
+  static bool bendWasActive = false;
+  bool bendActiveNow = false;
+
+  int n = M5.Touch.getCount();
+  for (int i = 0; i < n; i++) {
+    auto t = M5.Touch.getDetail(i);
+    if (!t.isPressed()) continue;
+    for (int s = 0; s < EFX_COUNT; s++) {
+      if (!touchInRect(t.x, t.y, effectSliders[s])) continue;
+      float rel = (t.x - effectSliders[s].x) / (float)effectSliders[s].w;
+      if (rel < 0.0f) rel = 0.0f;
+      if (rel > 1.0f) rel = 1.0f;
+      switch (s) {
+        case 0:  // Perf — stays where it's set
+          if (fabsf(rel - perfParam) > 0.01f) {
+            perfParam = rel;
+            drawSlider(0, "Perf", perfParam, false);
+          }
+          break;
+        case 1:  // Bend — bipolar, springs back
+          if (fabsf(rel - bendValue) > 0.005f) {
+            bendValue = rel;
+            applyPitchBend();
+            drawSlider(1, "Bend", bendValue, true);
+          }
+          bendActiveNow = true;
+          break;
+        case 2:  // Reverb
+          if (fabsf(rel - reverbMix) > 0.01f) {
+            reverbMix = rel;
+            applyMixEffects();
+            drawSlider(2, "Reverb", reverbMix, false);
+          }
+          break;
+        case 3:  // Chorus
+          if (fabsf(rel - chorusMix) > 0.01f) {
+            chorusMix = rel;
+            applyMixEffects();
+            drawSlider(3, "Chorus", chorusMix, false);
+          }
+          break;
+      }
+    }
+  }
+
+  if (bendWasActive && !bendActiveNow) {
+    bendValue = 0.5f;
+    applyPitchBend();
+    drawSlider(1, "Bend", bendValue, true);
+  }
+  bendWasActive = bendActiveNow;
 }
 
 // ==== Setup ====
-
 void setup() {
   M5.begin();
-  M5.Lcd.setRotation(1); // Landscape
+  M5.Lcd.setRotation(1);
   M5.Lcd.fillScreen(COL_BG);
 
-  // Initialize Serial2 for MIDI (M5 Unit MIDI via PortA)
   Serial2.begin(MIDI_BAUD, SERIAL_8N1, RXD2, TXD2);
+  randomSeed(esp_random());
 
-  // Initialize voices
-  for (int i = 0; i < MAX_VOICES; i++) {
-    voices[i].active = false;
-  }
-
-  // Initialize speaker
-  auto cfg = M5.Speaker.config();
-  cfg.sample_rate = SAMPLE_RATE;
-  cfg.task_pinned_core = 0;
-  M5.Speaker.config(cfg);
-  M5.Speaker.begin();
+  sendAllNotesOff(MIDI_CH_CHORD);
+  sendAllNotesOff(MIDI_CH_BASS);
+  applyChordProgram();
+  applyMixEffects();
+  applyPitchBend();
 
   drawUI();
 }
 
 // ==== Loop ====
-
 void loop() {
   M5.update();
 
-  // Process MIDI input
   processMIDI();
 
-  // Handle touch
-  static bool wasTouched = false;
-  auto t = M5.Touch.getDetail();
-
-  if (t.wasPressed()) {
-    handleTouch(t.x, t.y);
-    wasTouched = true;
-  } else if (t.wasReleased() && wasTouched) {
-    handleTouchRelease();
-    wasTouched = false;
+  int n = M5.Touch.getCount();
+  for (int i = 0; i < n; i++) {
+    auto t = M5.Touch.getDetail(i);
+    if (t.wasPressed()) handleTouchPress(t.x, t.y);
   }
 
-  // Generate audio samples
-  static int16_t audioBuffer[BUFFER_SIZE * 2]; // Stereo
+  updateSliderDrag();
 
-  for (int i = 0; i < BUFFER_SIZE; i++) {
-    float mixL = 0.0f;
-    float mixR = 0.0f;
-
-    // Mix all active voices
-    for (int v = 0; v < MAX_VOICES; v++) {
-      if (voices[v].active) {
-        updateEnvelope(voices[v], 1.0f / SAMPLE_RATE);
-        float sample = generateSample(voices[v]);
-        mixL += sample;
-        mixR += sample;
-      }
+  static bool pianoHeldLast = false;
+  static int  noPianoFrames = 0;
+  bool pianoHeld = anyTouchOnPiano();
+  if (pianoHeld) {
+    noPianoFrames = 0;
+    pianoHeldLast = true;
+  } else if (pianoHeldLast) {
+    if (++noPianoFrames >= 3) {
+      stopChord();
+      pianoHeldLast = false;
+      noPianoFrames = 0;
     }
-
-    // Normalize and convert to int16
-    mixL = constrain(mixL * 0.3f, -1.0f, 1.0f);
-    mixR = constrain(mixR * 0.3f, -1.0f, 1.0f);
-
-    audioBuffer[i * 2] = (int16_t)(mixL * 32767);
-    audioBuffer[i * 2 + 1] = (int16_t)(mixR * 32767);
   }
 
-  // Play audio
-  M5.Speaker.playRaw(audioBuffer, BUFFER_SIZE * 2, SAMPLE_RATE, true, 1, 0);
+  tickStrum();
+  tickArp();
 
   delay(1);
 }
