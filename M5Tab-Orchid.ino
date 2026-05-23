@@ -10,15 +10,30 @@
 //   - Bass synth engine for low frequencies
 //   - Effects: delay, reverb, chorus
 //   - 1280x720 touch UI optimized for Tab5
+//   - MIDI input support (M5 Unit MIDI via PortA)
+//   - Program Change for preset/engine/chord switching
 //
 // UI Layout:
 //   - Top: Synth engine selector, preset display
 //   - Center: One-octave velocity-sensitive keyboard (root note selection)
 //   - Middle: Chord type selector (Major, Minor, 7th, Sus, Dim, Aug, etc.)
 //   - Bottom: Chord voicing controls, bass toggle, effects panel
+//
+// MIDI Program Change mapping:
+//   PC 0-2   : Synth engines (Analog, FM, Piano)
+//   PC 10-19 : Chord types (Major, Minor, Maj7, Min7, Dom7, Sus2, Sus4, Dim, Aug, Add9)
+//   PC 100   : Bass toggle ON
+//   PC 101   : Bass toggle OFF
+//   PC 110-127: Presets (engine + effects combinations)
 
 #include <M5Unified.h>
+#include <driver/uart.h>
 #include <math.h>
+
+// ==== Tab5 PortA UART for M5 Unit MIDI ====
+#define RXD2 54
+#define TXD2 53
+#define MIDI_BAUD 31250
 
 // ==== Screen ====
 static constexpr int SCREEN_W = 1280;
@@ -40,6 +55,7 @@ static constexpr uint16_t COL_WHITEKEY   = TFT_WHITE;
 static constexpr uint16_t COL_BLACKKEY   = 0x2104;
 static constexpr uint16_t COL_ACCENT     = TFT_CYAN;
 static constexpr uint16_t COL_VALUE      = TFT_YELLOW;
+static constexpr uint16_t COL_MUTED      = 0x7BEF;  // grey
 
 // ==== Synth Configuration ====
 static constexpr int MAX_VOICES = 16;
@@ -115,6 +131,33 @@ static uint8_t bassNote = 0;
 static float delayMix = 0.0f;
 static float reverbMix = 0.0f;
 static float chorusMix = 0.0f;
+
+// MIDI state
+static unsigned long midiInCount = 0;
+static uint8_t currentPreset = 0;
+
+// ==== Preset Structure ====
+struct Preset {
+  SynthEngine engine;
+  float delay;
+  float reverb;
+  float chorus;
+  bool bass;
+  const char* name;
+};
+
+// Preset bank (PC 110-127)
+static const Preset presets[] = {
+  {ENGINE_VIRTUAL_ANALOG, 0.0f, 0.2f, 0.0f, false, "Clean Analog"},
+  {ENGINE_VIRTUAL_ANALOG, 0.3f, 0.4f, 0.1f, true,  "Bass Analog"},
+  {ENGINE_FM, 0.4f, 0.3f, 0.2f, false, "FM Space"},
+  {ENGINE_FM, 0.1f, 0.5f, 0.0f, false, "FM Reverb"},
+  {ENGINE_LEAD_PIANO, 0.2f, 0.3f, 0.0f, false, "Piano"},
+  {ENGINE_LEAD_PIANO, 0.3f, 0.6f, 0.2f, true,  "Piano Hall"},
+  {ENGINE_VIRTUAL_ANALOG, 0.5f, 0.5f, 0.3f, true,  "Ambient"},
+  {ENGINE_FM, 0.6f, 0.7f, 0.4f, false, "Deep Space"},
+};
+static constexpr int PRESET_COUNT = sizeof(presets) / sizeof(Preset);
 
 // ==== UI Geometry ====
 struct Rect { int x, y, w, h; };
@@ -302,6 +345,115 @@ void stopChord() {
   allNotesOff();
 }
 
+// ==== MIDI Functions ====
+
+void loadPreset(uint8_t presetNum) {
+  if (presetNum >= PRESET_COUNT) return;
+
+  const Preset& p = presets[presetNum];
+  currentEngine = p.engine;
+  delayMix = p.delay;
+  reverbMix = p.reverb;
+  chorusMix = p.chorus;
+  bassEnabled = p.bass;
+  currentPreset = presetNum;
+
+  // Redraw UI
+  drawUI();
+}
+
+void handleProgramChange(uint8_t channel, uint8_t program) {
+  if (program <= 2) {
+    // PC 0-2: Synth engines
+    currentEngine = (SynthEngine)program;
+    drawEngineSelector();
+  } else if (program >= 10 && program < 10 + CHORD_COUNT) {
+    // PC 10-19: Chord types
+    currentChordType = (ChordType)(program - 10);
+    drawChordTypeButtons();
+  } else if (program == 100) {
+    // PC 100: Bass ON
+    bassEnabled = true;
+    drawBassToggle();
+  } else if (program == 101) {
+    // PC 101: Bass OFF
+    bassEnabled = false;
+    drawBassToggle();
+  } else if (program >= 110 && program < 110 + PRESET_COUNT) {
+    // PC 110-127: Presets
+    loadPreset(program - 110);
+  }
+}
+
+void processMIDI() {
+  static uint8_t midiStatus = 0;
+  static uint8_t midiData1 = 0;
+  static uint8_t midiRunningStatus = 0;
+
+  while (Serial2.available()) {
+    uint8_t b = Serial2.read();
+    midiInCount++;
+
+    if (b & 0x80) {
+      // Status byte
+      midiStatus = b;
+      midiRunningStatus = b;
+      midiData1 = 0;
+    } else {
+      // Data byte
+      if (midiStatus == 0 && midiRunningStatus != 0) {
+        midiStatus = midiRunningStatus;
+      }
+
+      uint8_t msgType = midiStatus & 0xF0;
+      uint8_t channel = midiStatus & 0x0F;
+
+      if (msgType == 0xC0) {
+        // Program Change (1 data byte)
+        handleProgramChange(channel, b);
+        midiStatus = 0;
+      } else if (msgType == 0x90) {
+        // Note On (2 data bytes)
+        if (midiData1 == 0) {
+          midiData1 = b;
+        } else {
+          if (b > 0) {
+            // Note On with velocity
+            rootNote = midiData1;
+            playChord(rootNote, currentChordType, b);
+          } else {
+            // Note On with velocity 0 = Note Off
+            stopChord();
+          }
+          midiStatus = 0;
+          midiData1 = 0;
+        }
+      } else if (msgType == 0x80) {
+        // Note Off (2 data bytes)
+        if (midiData1 == 0) {
+          midiData1 = b;
+        } else {
+          stopChord();
+          midiStatus = 0;
+          midiData1 = 0;
+        }
+      } else if (msgType == 0xB0) {
+        // Control Change (2 data bytes) - for future use
+        if (midiData1 == 0) {
+          midiData1 = b;
+        } else {
+          midiStatus = 0;
+          midiData1 = 0;
+        }
+      } else {
+        // Other messages - ignore for now
+        midiStatus = 0;
+        midiData1 = 0;
+      }
+    }
+  }
+}
+
 // ==== UI Drawing ====
 
 void drawPianoKeyboard() {
@@ -388,6 +540,27 @@ void drawEngineSelector() {
   M5.Lcd.setTextColor(COL_ACCENT);
   M5.Lcd.setTextDatum(top_left);
   M5.Lcd.drawString("Orchid Synth", startX, startY);
+
+  // Display current preset name
+  if (currentPreset < PRESET_COUNT) {
+    M5.Lcd.setFont(FONT_SMALL);
+    M5.Lcd.setTextColor(COL_VALUE);
+    M5.Lcd.drawString(presets[currentPreset].name, startX + 250, startY + 10);
+  }
+
+  // MIDI activity indicator
+  static unsigned long lastMidiTime = 0;
+  if (midiInCount > 0 && millis() - lastMidiTime < 100) {
+    M5.Lcd.fillCircle(startX + 450, startY + 20, 10, TFT_GREEN);
+  } else {
+    M5.Lcd.fillCircle(startX + 450, startY + 20, 10, COL_PANEL);
+  }
+  if (midiInCount > 0) lastMidiTime = millis();
+
+  M5.Lcd.setFont(FONT_SMALL);
+  M5.Lcd.setTextColor(COL_MUTED);
+  M5.Lcd.setTextDatum(top_left);
+  M5.Lcd.drawString("MIDI", startX + 470, startY + 12);
 
   for (int i = 0; i < 3; i++) {
     int x = startX + i * (btnW + spacing);
@@ -545,6 +718,9 @@ void setup() {
   M5.Lcd.setRotation(1); // Landscape
   M5.Lcd.fillScreen(COL_BG);
 
+  // Initialize Serial2 for MIDI (M5 Unit MIDI via PortA)
+  Serial2.begin(MIDI_BAUD, SERIAL_8N1, RXD2, TXD2);
+
   // Initialize voices
   for (int i = 0; i < MAX_VOICES; i++) {
     voices[i].active = false;
@@ -564,6 +740,9 @@ void setup() {
 
 void loop() {
   M5.update();
+
+  // Process MIDI input
+  processMIDI();
 
   // Handle touch
   static bool wasTouched = false;
